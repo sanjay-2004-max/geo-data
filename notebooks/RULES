@@ -1,0 +1,488 @@
+# Sobeys Geography ETL Pipeline – Transformation Logic and Business Rules
+
+## 1. Purpose
+
+This document explains the transformation logic, business rules, and calculations implemented in the Sobeys Geography ETL Pipeline.
+
+The objective is to transform raw geographical, population, and store master data into a Gold dataset containing store-level population allocation and province-level population weight percentages.
+
+The final output supports geographical population allocation for the Marketing Mix Modelling (MMM) platform.
+
+**Technology stack:**
+- Microsoft Azure Data Lake Storage Gen2
+- Azure Databricks
+- Apache Spark
+- Spark SQL
+- Python
+- Delta Lake
+- Unity Catalog
+
+---
+
+## 2. Source Data
+
+The pipeline processes five source CSV files:
+
+| Source file | Description |
+|---|---|
+| `dim_city_clean.csv` | City master data |
+| `dim_population.csv` | Population information |
+| `dim_province.csv` | Province master data |
+| `dim_zipcode_clean.csv` | ZIP/postal code information |
+| `store_master.csv` | Store master information |
+
+The source files are stored in the Databricks Unity Catalog Volume:
+
+`/Volumes/geo_data_databricks/bronze/raw-csv-files/`
+
+---
+
+## 3. Bronze Layer – Raw Data Ingestion
+
+### Objective
+
+Load the source CSV files into Bronze Delta tables while retaining the original source data.
+
+### Transformations performed
+
+1. Read the five CSV files from the Unity Catalog Volume.
+2. Enable CSV header recognition.
+3. Infer the source column data types.
+4. Capture records containing unexpected or unrecognized data in the `_rescued_data` column.
+5. Create or replace the corresponding Bronze Delta tables.
+
+### Bronze tables
+
+| Source file | Bronze table |
+|---|---|
+| `dim_city_clean.csv` | `bronze.raw_city` |
+| `dim_population.csv` | `bronze.raw_population` |
+| `dim_province.csv` | `bronze.raw_province` |
+| `dim_zipcode_clean.csv` | `bronze.raw_zipcode` |
+| `store_master.csv` | `bronze.raw_store_master` |
+
+### Ingestion configuration
+
+- Format: CSV
+- Header: Enabled
+- Schema inference: Enabled
+- Rescued data column: `_rescued_data`
+- Storage format: Delta Lake
+
+### Business rule
+
+The Bronze layer acts as the raw landing and ingestion layer. No geographical mapping or population allocation calculations are performed here.
+
+---
+
+## 4. Silver Layer – Data Cleaning and Standardization
+
+### Objective
+
+Clean and standardize the Bronze data before performing geographical mapping and population allocation.
+
+### 4.1 Standardization rules
+
+The following transformations are applied to the source columns.
+
+| Transformation | SQL function | Purpose |
+|---|---|---|
+| Remove leading and trailing spaces | `TRIM()` | Standardize text values |
+| Convert empty strings to NULL | `NULLIF(column, '')` | Handle empty values |
+| Convert text to uppercase | `UPPER()` | Standardize codes and text |
+| Preserve rescued data | `_rescued_data` | Retain information about unexpected source data |
+
+### Example transformation
+
+`UPPER(NULLIF(TRIM(fsa), ''))`
+
+This transformation:
+1. Removes leading and trailing spaces.
+2. Converts an empty string into NULL.
+3. Converts the remaining value into uppercase.
+
+### 4.2 Silver standardized tables
+
+| Bronze source table | Silver standardized table |
+|---|---|
+| `bronze.raw_city` | `silver.silver_city` |
+| `bronze.raw_population` | `silver.silver_population` |
+| `bronze.raw_province` | `silver.silver_province` |
+| `bronze.raw_zipcode` | `silver.silver_zipcode` |
+| `bronze.raw_store_master` | `silver.silver_store_master` |
+
+The `_rescued_data` column is retained for subsequent data quality validation.
+
+---
+
+## 5. Silver Layer – Geographical Mapping and Population Allocation
+
+After standardization, four intermediate transformation tables are created.
+
+### Step 1: Create FSA Population Mapping
+
+**Output table:** `silver.silver_fsa_population`
+
+**Objective:** Connect population information with its corresponding FSA, city, and province.
+
+### Join logic
+
+The following relationships are used:
+
+| Left table | Right table | Join condition |
+|---|---|---|
+| `silver_population` | `silver_zipcode` | `pop.zipcode_id = z.zipcode_id` |
+| `silver_zipcode` | `silver_city` | `z.city_id = c.city_id` |
+| `silver_city` | `silver_province` | `c.province_id = p.province_id` |
+
+### Output columns
+
+- `fsa_code`
+- `province_name`
+- `population_count`
+
+The output establishes the geographical population information required for store mapping.
+
+No population allocation calculation is performed at this stage.
+
+---
+
+### Step 2: Create Store-to-FSA Mapping
+
+**Output table:** `silver.silver_store_fsa_mapping`
+
+**Objective:** Associate each store with the corresponding FSA population information.
+
+### Join condition
+
+The store master data is joined with the FSA population mapping using:
+
+`ON s.fsa_code = f.fsa_code`
+
+### Output columns
+
+- `store_id`
+- `banner`
+- `city_name`
+- `province_name`
+- `fsa_code`
+- `store_size`
+- `population_count`
+
+### Business rule
+
+Each store is associated with the population information of its corresponding FSA.
+
+This mapping establishes the relationship between store information and geographical population data.
+
+---
+
+### Step 3: Calculate Store Area Share
+
+**Output table:** `silver.silver_store_area_share`
+
+**Objective:** Calculate each store's proportion of the total store size within its FSA.
+
+### Formula
+
+Store Area Share:
+
+Store Size / Total Store Size within the same FSA
+
+Mathematically:
+
+`Store Area Share = Store Size / SUM(Store Size) OVER (PARTITION BY FSA)`
+
+### SQL implementation logic
+
+A window function is used:
+
+`SUM(store_size) OVER (PARTITION BY fsa_code)`
+
+This calculates the total store size for all stores belonging to the same FSA.
+
+The individual store size is divided by that FSA total.
+
+`NULLIF()` is used to prevent division by zero.
+
+The calculation uses `DECIMAL(38,6)` precision.
+
+### Example
+
+Suppose an FSA contains three stores:
+
+| Store | Store size |
+|---|---:|
+| Store A | 1,000 |
+| Store B | 2,000 |
+| Store C | 3,000 |
+| Total | 6,000 |
+
+Calculations:
+
+- Store A: 1,000 / 6,000 = 0.166667
+- Store B: 2,000 / 6,000 = 0.333333
+- Store C: 3,000 / 6,000 = 0.500000
+
+| Store | Store Area Share |
+|---|---:|
+| Store A | 0.166667 |
+| Store B | 0.333333 |
+| Store C | 0.500000 |
+| Total | 1.000000 |
+
+### Business rule
+
+The total store area share within an FSA should equal 1 (100%), provided the FSA has a non-zero total store size and all relevant stores are included.
+
+---
+
+### Step 4: Calculate Store Population Allocation
+
+**Output table:** `silver.silver_store_population_allocation`
+
+**Objective:** Allocate the FSA population among stores based on their respective store area shares.
+
+### Formula
+
+Population Share Value:
+
+`Population Count × Store Area Share`
+
+### Example
+
+Assume the FSA population is 12,000.
+
+Using the previous store area shares:
+
+| Store | Population count | Store Area Share | Population Share Value |
+|---|---:|---:|---:|
+| Store A | 12,000 | 0.166667 | 2,000 |
+| Store B | 12,000 | 0.333333 | 4,000 |
+| Store C | 12,000 | 0.500000 | 6,000 |
+| Total | | 1.000000 | 12,000 |
+
+### Business rule
+
+The FSA population is distributed among its mapped stores according to their relative store sizes.
+
+The calculation uses decimal precision to retain fractional allocation values where necessary.
+
+The output column is:
+
+`population_share_value`
+
+---
+
+## 6. Gold Layer – Final Store Population Weights
+
+### Objective
+
+Calculate the percentage contribution of each store's allocated population share relative to the total allocated population share within its province.
+
+**Output table:**
+
+`geo_data_databricks.gold.gold_store_population`
+
+### Formula
+
+Province Population Weight Percentage:
+
+`(Store Population Share Value / Total Population Share Value within the Province) × 100`
+
+Mathematically:
+
+`(population_share_value / SUM(population_share_value) OVER (PARTITION BY province_name)) × 100`
+
+### SQL functions used
+
+- `SUM()` – Calculates the total allocated population share within each province.
+- `OVER()` – Applies the calculation using a window function.
+- `PARTITION BY province_name` – Separates the calculation by province.
+- `NULLIF(..., 0)` – Prevents division by zero.
+
+### Example
+
+Assume a province has three stores:
+
+| Store | Population Share Value |
+|---|---:|
+| Store A | 2,000 |
+| Store B | 4,000 |
+| Store C | 6,000 |
+| Total | 12,000 |
+
+Calculations:
+
+- Store A: (2,000 / 12,000) × 100 = 16.67%
+- Store B: (4,000 / 12,000) × 100 = 33.33%
+- Store C: (6,000 / 12,000) × 100 = 50.00%
+
+| Store | Population Share Value | Province Population Weight |
+|---|---:|---:|
+| Store A | 2,000 | 16.67% |
+| Store B | 4,000 | 33.33% |
+| Store C | 6,000 | 50.00% |
+| Total | 12,000 | 100.00% |
+
+### Business rule
+
+The sum of store-level province population weights should equal 100% within each province, provided the denominator is non-zero and all intended records are included.
+
+The final Gold table retains the existing columns and adds:
+
+`province_population_weight_percentage`
+
+---
+
+## 7. Python – Export Gold Data to ADLS Gen2
+
+### Objective
+
+Export the final Gold Delta table as CSV files into Azure Data Lake Storage Gen2.
+
+### Source table
+
+`geo_data_databricks.gold.gold_store_population`
+
+### Destination
+
+`abfss://geo-data@geodatademo.dfs.core.windows.net/gold-outputs/gold_store_population_csv/`
+
+### Export operations
+
+1. Read the final Gold table using `spark.table()`.
+2. Use `coalesce(1)` to reduce the output to one partition.
+3. Write the DataFrame in CSV format.
+4. Enable the CSV header.
+5. Use overwrite mode.
+6. Save the output to the specified ADLS Gen2 location.
+
+### Output
+
+The final store population dataset is available in the Gold output location in ADLS Gen2.
+
+---
+
+## 8. Data Quality Validation
+
+The pipeline includes data quality checks against the final Gold table and standardized Silver tables.
+
+### Check 1: Total Record Count
+
+**Objective:** Verify that the Gold table contains records.
+
+Rule:
+
+`COUNT(*) > 0`
+
+If the table is empty, validation fails.
+
+### Check 2: Duplicate Store ID
+
+**Objective:** Ensure that each store ID occurs only once in the Gold output.
+
+Rule:
+
+`GROUP BY store_id HAVING COUNT(*) > 1`
+
+The expected duplicate group count is zero.
+
+### Check 3: NULL Value Validation
+
+The following columns are checked:
+
+- `store_id`
+- `fsa_code`
+- `population_count`
+- `store_size`
+- `store_area_share`
+- `population_share_value`
+- `province_population_weight_percentage`
+
+Expected result: Zero NULL values in these required columns.
+
+### Check 4: Negative Value Validation
+
+The following columns are checked for negative values:
+
+- `store_size`
+- `population_count`
+- `store_area_share`
+- `population_share_value`
+- `province_population_weight_percentage`
+
+Expected result: Zero records containing negative values.
+
+### Check 5: Rescued Data Validation
+
+The following Silver tables are checked:
+
+- `silver_city`
+- `silver_population`
+- `silver_province`
+- `silver_zipcode`
+- `silver_store_master`
+
+The `_rescued_data` column is checked for non-NULL values.
+
+Expected result: Zero rescued records.
+
+If any rescued records are found, validation fails and requires investigation.
+
+### Final validation status
+
+The validation script reports PASS only when all five checks succeed.
+
+---
+
+## 9. Final Pipeline Table Summary
+
+| Layer | Table | Purpose |
+|---|---|---|
+| Bronze | `raw_city` | Raw city data |
+| Bronze | `raw_population` | Raw population data |
+| Bronze | `raw_province` | Raw province data |
+| Bronze | `raw_zipcode` | Raw ZIP/postal code data |
+| Bronze | `raw_store_master` | Raw store master data |
+| Silver | `silver_city` | Standardized city data |
+| Silver | `silver_population` | Standardized population data |
+| Silver | `silver_province` | Standardized province data |
+| Silver | `silver_zipcode` | Standardized ZIP/postal code data |
+| Silver | `silver_store_master` | Standardized store data |
+| Silver | `silver_fsa_population` | FSA-level population mapping |
+| Silver | `silver_store_fsa_mapping` | Store-to-FSA mapping |
+| Silver | `silver_store_area_share` | Store area share calculation |
+| Silver | `silver_store_population_allocation` | Store-level population allocation |
+| Gold | `gold_store_population` | Final store population weights |
+
+---
+
+## 10. Final Output and Intended Use
+
+The final Gold dataset provides:
+
+- Store identification
+- Store banner and geographical information
+- FSA population information
+- Store size
+- Store area share
+- Store-level population allocation
+- Province-level population weight percentage
+
+This dataset is intended to support the geographical allocation of marketing spend across Sobeys stores for the Marketing Mix Modelling platform.
+
+**Important:** Population allocation is based on store size as the allocation factor. It represents an allocation methodology, not a direct measurement of actual customers or store visitors.
+
+---
+
+## 11. Implementation Notes
+
+- Bronze ingestion uses `CREATE OR REPLACE TABLE`.
+- Silver transformations standardize source data before geographical mapping.
+- Population allocation is calculated using store size within each FSA.
+- Gold weights are calculated using province-level window aggregation.
+- The pipeline uses Delta tables within Unity Catalog.
+- Python is used to export the Gold output to ADLS Gen2.
+- Data quality validation is performed separately using the validation script in the `tests` folder.
+
